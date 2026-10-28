@@ -4,7 +4,7 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
-import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -54,6 +54,10 @@ function carregarBanco() {
 }
 
 let banco = carregarBanco();
+let qrAtual = '';
+let qrGeradoEm = 0;
+let socketWhatsApp;
+let reconectando = false;
 
 function formatarLitros(valor) {
   return Number(valor).toLocaleString('pt-BR', {
@@ -164,12 +168,10 @@ function processarMensagem(texto, remetente, nome) {
 
   salvarBanco();
 
-  const sinal = tipo === 'ABASTECIDO' ? '-' : '+';
-
-  return `${tipo === 'ABASTECIDO' ? 'Abastecimento' : 'Entrada'} registrada: ${sinal}${formatarLitros(quantidade)} L.\n${textoEstoque()}`;
+  return `${tipo === 'ABASTECIDO' ? 'Abastecimento registrado: -' : 'Entrada registrada: +'}${formatarLitros(quantidade)} L.\n${textoEstoque()}`;
 }
 
-// Servidor para verificar se o serviço está ativo.
+// Servidor web
 const app = express();
 
 app.get('/', (_req, res) => {
@@ -180,12 +182,74 @@ app.get('/health', (_req, res) => {
   res.json({ ativo: true, estoque: banco.estoque });
 });
 
+// Página temporária para mostrar o QR Code.
+// Proteja ou remova esta rota após conectar o WhatsApp.
+app.get('/qr', async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (!qrAtual || Date.now() - qrGeradoEm > 60000) {
+    return res.status(404).send(
+      'QR Code indisponível ou expirado. Confira os logs do serviço e atualize a página.'
+    );
+  }
+
+  try {
+    const imagem = await QRCode.toDataURL(qrAtual, {
+      width: 350,
+      margin: 3,
+      errorCorrectionLevel: 'M'
+    });
+
+    res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>Conectar WhatsApp - Code Tank</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 20px;
+      background: #f4f4f4;
+      color: #222;
+    }
+    main {
+      max-width: 430px;
+      margin: 0 auto;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+    }
+    img {
+      display: block;
+      width: 100%;
+      max-width: 350px;
+      height: auto;
+      margin: 15px auto;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h2>Code Tank</h2>
+    <p>Abra o WhatsApp no celular e vá em Aparelhos conectados → Conectar um aparelho.</p>
+    <img src="${imagem}" alt="QR Code de conexão do WhatsApp">
+    <p>Não compartilhe esta página. O QR Code permite vincular sua conta.</p>
+    <p>Se expirar, atualize a página para verificar se um novo QR foi gerado.</p>
+  </main>
+</body>
+</html>`);
+  } catch (erro) {
+    console.error('Erro ao gerar a imagem do QR Code:', erro);
+    res.status(500).send('Não foi possível gerar o QR Code.');
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor ativo na porta ${PORT}`);
 });
-
-let socketWhatsApp;
-let reconectando = false;
 
 async function conectarWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -193,7 +257,6 @@ async function conectarWhatsApp() {
   const socket = makeWASocket({
     auth: state,
     browser: ['Code Tank', 'Chrome', '1.0.0'],
-    printQRInTerminal: false,
     markOnlineOnConnect: false
   });
 
@@ -202,19 +265,22 @@ async function conectarWhatsApp() {
 
   socket.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log('Escaneie o QR Code com o WhatsApp:');
-      qrcode.generate(qr, { small: true });
-      console.log('WhatsApp > Aparelhos conectados > Conectar um aparelho');
+      qrAtual = qr;
+      qrGeradoEm = Date.now();
+      console.log('QR Code disponível temporariamente na rota /qr');
     }
 
     if (connection === 'open') {
+      qrAtual = '';
       console.log('WhatsApp conectado!');
       reconectando = false;
     }
 
     if (connection === 'close' && !reconectando) {
       const motivo = lastDisconnect?.error?.output?.statusCode;
+
       if (motivo === DisconnectReason.loggedOut) {
+        qrAtual = '';
         console.error('Sessão encerrada. Será necessário conectar novamente.');
         return;
       }
@@ -262,8 +328,6 @@ async function conectarWhatsApp() {
   });
 }
 
-// Relatório automático às 19h, horário de Brasília.
-// Só envia para o grupo quando GROUP_ONLY estiver configurado.
 function partesHorarioBrasilia() {
   const partes = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Sao_Paulo',
@@ -278,6 +342,7 @@ function partesHorarioBrasilia() {
   return Object.fromEntries(partes.map(p => [p.type, p.value]));
 }
 
+// Relatório diário às 19h, horário de Brasília.
 setInterval(async () => {
   try {
     const horario = partesHorarioBrasilia();
@@ -287,7 +352,7 @@ setInterval(async () => {
     if (banco.ultimoRelatorio === hoje) return;
 
     if (!GROUP_ONLY || !socketWhatsApp?.user) {
-      console.log('Relatório das 19h pendente: configure GROUP_ONLY e conecte o WhatsApp.');
+      console.log('Relatório pendente: configure GROUP_ONLY e conecte o WhatsApp.');
       return;
     }
 
