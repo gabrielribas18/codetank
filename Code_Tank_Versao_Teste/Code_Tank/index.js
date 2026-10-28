@@ -13,7 +13,7 @@ const GROUP_ONLY = process.env.GROUP_ONLY || '';
 const DATA_DIR = process.env.DATA_DIR || './data';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 
-const ESTOQUE_INICIAL = 0000;
+const ESTOQUE_INICIAL = 0;
 const CAPACIDADE_MAXIMA = 14900;
 const LIMITE_ALERTA = 3000;
 
