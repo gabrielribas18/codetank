@@ -11,9 +11,9 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("tanque_diesel.db")
-CAPACIDADE_MAXIMA = 14500.0
-LIMITE_ALERTA = 8000.0
-ESTOQUE_INICIAL = 10000.0
+CAPACIDADE_MAXIMA = 14900.0
+LIMITE_ALERTA = 3000.0
+ESTOQUE_INICIAL = 0.0
 
 
 def conectar():
