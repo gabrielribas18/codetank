@@ -71,7 +71,7 @@ function textoEstoque() {
     `Capacidade máxima: ${formatarLitros(CAPACIDADE_MAXIMA)} L`;
 
   if (banco.estoque <= LIMITE_ALERTA) {
-    texto += '\n⚠️ ALERTA: estoque em 8.000 L ou menos!';
+    texto += '\n⚠️ ALERTA: estoque em 3.000 L ou menos!';
   }
 
   return texto;
