@@ -2,7 +2,6 @@
 {
   "name": "codetank",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.js"
@@ -11,8 +10,9 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "latest",
-    "express": "^4.21.2",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^5.1.0",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   }
 }
