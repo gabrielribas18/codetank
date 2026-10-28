@@ -160,7 +160,7 @@ def registrar_movimentacao(mensagem, origem="Terminal", chave_mensagem=None):
 
     resposta += f"\nEstoque atualizado: {saldo_atualizado:g} L."
     if saldo_atualizado <= LIMITE_ALERTA:
-        resposta += "\nALERTA: estoque em 8.000 L ou menos."
+        resposta += "\nALERTA: estoque em 3.000 L ou menos."
     return resposta
 
 
@@ -169,7 +169,7 @@ def mostrar_estoque():
     print(f"\nEstoque atual: {saldo:g} L")
     print(f"Capacidade máxima: {CAPACIDADE_MAXIMA:g} L")
     if saldo <= LIMITE_ALERTA:
-        print("ALERTA: estoque em 8.000 L ou menos.")
+        print("ALERTA: estoque em 3.000 L ou menos.")
 
 
 def mostrar_relatorio():
