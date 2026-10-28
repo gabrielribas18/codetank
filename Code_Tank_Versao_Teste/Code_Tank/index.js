@@ -13,9 +13,9 @@ const GROUP_ONLY = process.env.GROUP_ONLY || '';
 const DATA_DIR = process.env.DATA_DIR || './data';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 
-const ESTOQUE_INICIAL = 10000;
-const CAPACIDADE_MAXIMA = 14500;
-const LIMITE_ALERTA = 8000;
+const ESTOQUE_INICIAL = 0000;
+const CAPACIDADE_MAXIMA = 14900;
+const LIMITE_ALERTA = 3000;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
