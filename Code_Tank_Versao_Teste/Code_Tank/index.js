@@ -1,4 +1,3 @@
-
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
@@ -9,17 +8,17 @@ import {
   DisconnectReason,
 } from "@whiskeysockets/baileys";
 import fs from "node:fs";
+import path from "node:path";
 
 const { Pool } = pg;
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
-const AUTH_DIR = process.env.AUTH_DIR || "./auth";
-
 const TANQUE_CAPACIDADE = 14900;
 const ALERTA_ESTOQUE = 3000;
 const LIMITE_ABASTECIMENTOS = 2;
 const JANELA_LIMITE_MINUTOS = 20;
+const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 
 const GROUP_ONLY = (process.env.GROUP_ONLY || "")
   .split(",")
@@ -27,7 +26,7 @@ const GROUP_ONLY = (process.env.GROUP_ONLY || "")
   .filter(Boolean);
 
 if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL não configurada.");
+  throw new Error("A variável DATABASE_URL não foi configurada.");
 }
 
 const pool = new Pool({
@@ -41,31 +40,20 @@ const pool = new Pool({
 const app = express();
 app.use(express.json());
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || "info",
-});
-
 let sock;
 let qrAtual = null;
 let whatsappConectado = false;
 let iniciandoWhatsApp = false;
 
-// =====================================================
-// FUNÇÕES AUXILIARES
-// =====================================================
+const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+});
 
 function normalizarTexto(texto) {
   return String(texto || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .trim();
-}
-
-function formatarLitros(valor) {
-  return Number(valor).toLocaleString("pt-BR", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  });
 }
 
 function identificarMovimentacao(texto) {
@@ -82,17 +70,17 @@ function identificarMovimentacao(texto) {
   if (abastecido) {
     const litros = Number(abastecido[1].replace(",", "."));
 
-    if (Number.isFinite(litros) && litros > 0) {
-      return { tipo: "ABASTECIDO", litros };
-    }
+    return Number.isFinite(litros) && litros > 0
+      ? { tipo: "abastecido", litros }
+      : null;
   }
 
   if (entrada) {
     const litros = Number(entrada[1].replace(",", "."));
 
-    if (Number.isFinite(litros) && litros > 0) {
-      return { tipo: "ENTRADA", litros };
-    }
+    return Number.isFinite(litros) && litros > 0
+      ? { tipo: "entrada", litros }
+      : null;
   }
 
   return null;
@@ -139,78 +127,93 @@ function mensagemCitada(msg) {
     msg?.message?.imageMessage?.contextInfo ||
     msg?.message?.videoMessage?.contextInfo;
 
-  return context?.stanzaId || null;
+  if (!context?.stanzaId) return null;
+
+  return context.stanzaId;
 }
 
-// =====================================================
-// BANCO DE DADOS
-// =====================================================
+// ==========================================
+// INICIALIZAÇÃO DO BANCO
+// ==========================================
 
 async function inicializarBanco() {
-  const verificacao = await pool.query(`
-    SELECT
-      to_regclass('public.movimentacoes') AS movimentacoes,
-      to_regclass('public.tanque_estado') AS tanque_estado
+  const tabelas = await pool.query(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name IN ('movimentacoes', 'tanque_estado')
   `);
 
+  const existentes = new Set(
+    tabelas.rows.map((r) => r.table_name)
+  );
+
   if (
-    !verificacao.rows[0]?.movimentacoes ||
-    !verificacao.rows[0]?.tanque_estado
+    !existentes.has("movimentacoes") ||
+    !existentes.has("tanque_estado")
   ) {
     throw new Error(
-      "As tabelas movimentacoes e tanque_estado precisam existir."
+      "As tabelas public.movimentacoes e public.tanque_estado precisam existir no Neon."
     );
   }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS relatorios_enviados (
-      data_relatorio DATE NOT NULL,
-      grupo_jid TEXT NOT NULL,
-      enviado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (data_relatorio, grupo_jid)
+      data TEXT PRIMARY KEY,
+      enviado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 
-  // Não altera o saldo se a linha já existir.
   await pool.query(`
     INSERT INTO tanque_estado (id, estoque)
     VALUES (1, 0)
     ON CONFLICT (id) DO NOTHING
   `);
 
-  logger.info("Banco PostgreSQL pronto.");
+  logger.info(
+    "Banco PostgreSQL conectado. Estrutura existente preservada."
+  );
 }
+
+// ==========================================
+// ESTOQUE
+// ==========================================
 
 async function obterEstoque(client = pool) {
   const result = await client.query(
     "SELECT estoque FROM tanque_estado WHERE id = 1"
   );
 
-  if (!result.rows.length) {
-    throw new Error("Estoque do tanque não encontrado.");
-  }
+  return Number(result.rows[0]?.estoque ?? 0);
+}
 
-  return Number(result.rows[0].estoque);
+function formatarLitros(valor) {
+  return Number(valor).toLocaleString("pt-BR", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  });
 }
 
 async function textoEstoque() {
   const estoque = await obterEstoque();
 
   let resposta =
-    `⛽ *ESTOQUE ATUAL*\n` +
-    `${formatarLitros(estoque)} litros\n` +
-    `Capacidade: ${formatarLitros(TANQUE_CAPACIDADE)} litros`;
+    `⛽ *ESTOQUE ATUAL*\n${formatarLitros(estoque)} litros`;
 
   if (estoque < ALERTA_ESTOQUE) {
-    resposta += "\n⚠️ *ATENÇÃO: estoque abaixo de 3.000 litros!*";
+    resposta +=
+      "\n⚠️ *ATENÇÃO: estoque abaixo de 3.000 litros!*";
   }
+
+  resposta +=
+    `\nCapacidade: ${formatarLitros(TANQUE_CAPACIDADE)} litros`;
 
   return resposta;
 }
 
-// =====================================================
-// REGISTRAR MOVIMENTAÇÃO
-// =====================================================
+// ==========================================
+// REGISTRAR ENTRADA E ABASTECIMENTO
+// ==========================================
 
 async function registrarMovimentacao({
   tipo,
@@ -219,47 +222,42 @@ async function registrarMovimentacao({
   nome,
   grupo,
   messageId,
+  mensagem,
 }) {
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    const estado = await client.query(`
-      SELECT estoque
-      FROM tanque_estado
-      WHERE id = 1
-      FOR UPDATE
-    `);
+    const estado = await client.query(
+      "SELECT estoque FROM tanque_estado WHERE id = 1 FOR UPDATE"
+    );
 
-    if (!estado.rows.length) {
-      throw new Error("Estoque do tanque não encontrado.");
-    }
+    const estoqueAtual = Number(
+      estado.rows[0]?.estoque ?? 0
+    );
 
-    const estoqueAtual = Number(estado.rows[0].estoque);
+    const tipoBanco =
+      tipo === "abastecido" ? "ABASTECIDO" : "ENTRADA";
 
-    if (tipo === "ABASTECIDO") {
-      const limite = await client.query(
-        `
-          SELECT COUNT(*)::int AS total
-          FROM movimentacoes
-          WHERE tipo = 'ABASTECIDO'
-            AND remetente = $1
-            AND cancelada = FALSE
-            AND "timestamp" >=
-                NOW() - ($2 || ' minutes')::interval
-        `,
+    if (tipoBanco === "ABASTECIDO") {
+      const desde = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM movimentacoes
+         WHERE tipo = 'ABASTECIDO'
+           AND remetente = $1
+           AND cancelada = FALSE
+           AND "timestamp" >= NOW() - ($2 || ' minutes')::interval`,
         [remetente, String(JANELA_LIMITE_MINUTOS)]
       );
 
-      if (limite.rows[0].total >= LIMITE_ABASTECIMENTOS) {
+      if (desde.rows[0].total >= LIMITE_ABASTECIMENTOS) {
         await client.query("ROLLBACK");
 
         return {
           ok: false,
           mensagem:
-            `Limite atingido: máximo de ${LIMITE_ABASTECIMENTOS} ` +
-            `abastecimentos a cada ${JANELA_LIMITE_MINUTOS} minutos.`,
+            `Limite atingido: você pode registrar no máximo ${LIMITE_ABASTECIMENTOS} abastecimentos a cada ${JANELA_LIMITE_MINUTOS} minutos.`,
         };
       }
 
@@ -269,14 +267,13 @@ async function registrarMovimentacao({
         return {
           ok: false,
           mensagem:
-            `Estoque insuficiente. Disponível: ` +
-            `${formatarLitros(estoqueAtual)} litros.`,
+            `Estoque insuficiente. Disponível: ${formatarLitros(estoqueAtual)} litros.`,
         };
       }
     }
 
     const novoEstoque =
-      tipo === "ENTRADA"
+      tipoBanco === "ENTRADA"
         ? estoqueAtual + litros
         : estoqueAtual - litros;
 
@@ -286,8 +283,7 @@ async function registrarMovimentacao({
       return {
         ok: false,
         mensagem:
-          `Operação recusada. Capacidade máxima: ` +
-          `${formatarLitros(TANQUE_CAPACIDADE)} litros.`,
+          `Operação recusada. O tanque comporta no máximo ${formatarLitros(TANQUE_CAPACIDADE)} litros. Estoque atual: ${formatarLitros(estoqueAtual)} litros.`,
       };
     }
 
@@ -296,43 +292,58 @@ async function registrarMovimentacao({
 
       return {
         ok: false,
-        mensagem: "Operação recusada: estoque não pode ficar negativo.",
+        mensagem:
+          "Operação recusada: o estoque não pode ficar negativo.",
       };
     }
 
+    // CORREÇÃO: a coluna data agora é preenchida automaticamente.
+    // Também utiliza os nomes reais das colunas do banco.
+
     await client.query(
-      `
-        INSERT INTO movimentacoes (
-          tipo,
-          litros,
-          remetente,
-          nome,
-          mensagem,
-          "timestamp",
-          whatsapp_message_id,
-          grupo_jid,
-          cancelada,
-          criada_em
-        )
-        VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, FALSE, NOW())
-      `,
+      `INSERT INTO movimentacoes
+       (
+         tipo,
+         litros,
+         remetente,
+         nome,
+         mensagem,
+         "timestamp",
+         data,
+         whatsapp_message_id,
+         grupo_jid,
+         cancelada,
+         criada_em
+       )
+       VALUES (
+         $1,
+         $2,
+         $3,
+         $4,
+         $5,
+         NOW(),
+         TO_CHAR(
+           NOW() AT TIME ZONE 'America/Sao_Paulo',
+           'DD/MM/YYYY'
+         ),
+         $6,
+         $7,
+         FALSE,
+         NOW()
+       )`,
       [
-        tipo,
+        tipoBanco,
         litros,
         remetente,
         nome,
-        `${tipo}: ${formatarLitros(litros)}`,
+        mensagem || `${tipoBanco}: ${litros}`,
         messageId,
         grupo,
       ]
     );
 
     await client.query(
-      `
-        UPDATE tanque_estado
-        SET estoque = $1
-        WHERE id = 1
-      `,
+      "UPDATE tanque_estado SET estoque = $1 WHERE id = 1",
       [novoEstoque]
     );
 
@@ -341,7 +352,7 @@ async function registrarMovimentacao({
     return {
       ok: true,
       mensagem:
-        `✅ *${tipo === "ENTRADA" ? "ENTRADA REGISTRADA" : "ABASTECIMENTO REGISTRADO"}*\n` +
+        `✅ *${tipoBanco === "ENTRADA" ? "ENTRADA REGISTRADA" : "ABASTECIMENTO REGISTRADO"}*\n` +
         `Quantidade: ${formatarLitros(litros)} litros\n` +
         `Estoque atual: ${formatarLitros(novoEstoque)} litros` +
         (novoEstoque < ALERTA_ESTOQUE
@@ -354,7 +365,8 @@ async function registrarMovimentacao({
     if (error.code === "23505") {
       return {
         ok: false,
-        mensagem: "Esta mensagem já foi registrada anteriormente.",
+        mensagem:
+          "Esta mensagem já foi registrada anteriormente.",
       };
     }
 
@@ -364,33 +376,23 @@ async function registrarMovimentacao({
   }
 }
 
-// =====================================================
+// ==========================================
 // CANCELAR MOVIMENTAÇÃO
-// =====================================================
+// ==========================================
 
 async function cancelarMovimentacao({
   quantidade,
   mensagemId,
   remetente,
-  nome,
-  grupo,
-  cancelamentoMessageId,
 }) {
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    const estado = await client.query(`
-      SELECT estoque
-      FROM tanque_estado
-      WHERE id = 1
-      FOR UPDATE
-    `);
-
-    if (!estado.rows.length) {
-      throw new Error("Estoque do tanque não encontrado.");
-    }
+    await client.query(
+      "SELECT estoque FROM tanque_estado WHERE id = 1 FOR UPDATE"
+    );
 
     let query;
     let params;
@@ -400,19 +402,19 @@ async function cancelarMovimentacao({
         SELECT *
         FROM movimentacoes
         WHERE whatsapp_message_id = $1
-          AND tipo IN ('ENTRADA', 'ABASTECIDO')
           AND cancelada = FALSE
+          AND tipo IN ('ABASTECIDO', 'ENTRADA')
         FOR UPDATE
       `;
 
       params = [mensagemId];
-    } else if (quantidade !== null && quantidade !== undefined) {
+    } else if (quantidade != null) {
       query = `
         SELECT *
         FROM movimentacoes
         WHERE litros = $1
-          AND tipo IN ('ENTRADA', 'ABASTECIDO')
           AND cancelada = FALSE
+          AND tipo IN ('ABASTECIDO', 'ENTRADA')
         ORDER BY "timestamp" DESC, id DESC
         LIMIT 1
         FOR UPDATE
@@ -423,8 +425,8 @@ async function cancelarMovimentacao({
       query = `
         SELECT *
         FROM movimentacoes
-        WHERE tipo IN ('ENTRADA', 'ABASTECIDO')
-          AND cancelada = FALSE
+        WHERE cancelada = FALSE
+          AND tipo IN ('ABASTECIDO', 'ENTRADA')
         ORDER BY "timestamp" DESC, id DESC
         LIMIT 1
         FOR UPDATE
@@ -441,11 +443,12 @@ async function cancelarMovimentacao({
 
       return {
         ok: false,
-        mensagem: "Não encontrei movimentação ativa para cancelar.",
+        mensagem:
+          "Não encontrei movimentação ativa correspondente para cancelar.",
       };
     }
 
-    const estoqueAtual = Number(estado.rows[0].estoque);
+    const estoqueAtual = await obterEstoque(client);
     const litros = Number(mov.litros);
 
     const novoEstoque =
@@ -453,75 +456,78 @@ async function cancelarMovimentacao({
         ? estoqueAtual - litros
         : estoqueAtual + litros;
 
-    if (novoEstoque < 0 || novoEstoque > TANQUE_CAPACIDADE) {
+    if (
+      novoEstoque < 0 ||
+      novoEstoque > TANQUE_CAPACIDADE
+    ) {
       await client.query("ROLLBACK");
 
       return {
         ok: false,
         mensagem:
-          "Cancelamento recusado para não deixar o estoque negativo ou ultrapassar a capacidade.",
+          "Cancelamento recusado para não ultrapassar a capacidade do tanque ou deixar o estoque negativo.",
       };
     }
 
     await client.query(
-      `
-        UPDATE movimentacoes
-        SET cancelada = TRUE,
-            cancelada_por = $1,
-            cancelada_em = NOW(),
-            motivo_cancelamento = 'Cancelamento pelo WhatsApp'
-        WHERE id = $2
-          AND cancelada = FALSE
-      `,
+      `UPDATE movimentacoes
+       SET cancelada = TRUE,
+           cancelada_por = $1,
+           cancelada_em = NOW(),
+           motivo_cancelamento = 'Cancelamento pelo WhatsApp'
+       WHERE id = $2`,
       [remetente, mov.id]
     );
 
     await client.query(
-      `
-        INSERT INTO movimentacoes (
-          tipo,
-          litros,
-          remetente,
-          nome,
-          mensagem,
-          "timestamp",
-          whatsapp_message_id,
-          grupo_jid,
-          cancelada,
-          movimentacao_origem_id,
-          criada_em
-        )
-        VALUES (
-          'CANCELAMENTO',
-          $1,
-          $2,
-          $3,
-          $4,
-          NOW(),
-          $5,
-          $6,
-          FALSE,
-          $7,
-          NOW()
-        )
-      `,
+      `INSERT INTO movimentacoes
+       (
+         tipo,
+         litros,
+         remetente,
+         nome,
+         mensagem,
+         "timestamp",
+         data,
+         grupo_jid,
+         cancelada,
+         cancelada_por,
+         cancelada_em,
+         motivo_cancelamento,
+         movimentacao_origem_id,
+         criada_em
+       )
+       VALUES (
+         'CANCELAMENTO',
+         $1,
+         $2,
+         $3,
+         $4,
+         NOW(),
+         TO_CHAR(
+           NOW() AT TIME ZONE 'America/Sao_Paulo',
+           'DD/MM/YYYY'
+         ),
+         $5,
+         FALSE,
+         $2,
+         NOW(),
+         'Cancelamento pelo WhatsApp',
+         $6,
+         NOW()
+       )`,
       [
         litros,
         remetente,
-        nome,
-        `Cancelou movimentação #${mov.id}: ${mov.tipo} ${formatarLitros(litros)} L`,
-        cancelamentoMessageId,
-        grupo,
+        mov.nome || remetente,
+        `Cancelou movimentação #${mov.id}: ${mov.tipo} ${litros} L`,
+        mov.grupo_jid || null,
         mov.id,
       ]
     );
 
     await client.query(
-      `
-        UPDATE tanque_estado
-        SET estoque = $1
-        WHERE id = 1
-      `,
+      "UPDATE tanque_estado SET estoque = $1 WHERE id = 1",
       [novoEstoque]
     );
 
@@ -531,147 +537,33 @@ async function cancelarMovimentacao({
       ok: true,
       mensagem:
         `✅ *MOVIMENTAÇÃO CANCELADA*\n` +
-        `Registro: #${mov.id}\n` +
         `Tipo: ${mov.tipo}\n` +
         `Quantidade: ${formatarLitros(litros)} litros\n` +
         `Estoque atual: ${formatarLitros(novoEstoque)} litros`,
     };
   } catch (error) {
     await client.query("ROLLBACK");
-
-    if (error.code === "23505") {
-      return {
-        ok: false,
-        mensagem: "Este comando de cancelamento já foi processado.",
-      };
-    }
-
     throw error;
   } finally {
     client.release();
   }
 }
 
-// =====================================================
-// RELATÓRIO
-// =====================================================
-
-async function gerarRelatorio() {
-  const client = await pool.connect();
-
-  try {
-    const estoque = await obterEstoque(client);
-
-    const resultado = await client.query(`
-      SELECT
-        COALESCE(
-          SUM(CASE WHEN tipo = 'ENTRADA' THEN litros ELSE 0 END),
-          0
-        ) AS entradas,
-
-        COALESCE(
-          SUM(CASE WHEN tipo = 'ABASTECIDO' THEN litros ELSE 0 END),
-          0
-        ) AS abastecimentos,
-
-        COUNT(*)::int AS quantidade
-
-      FROM movimentacoes
-
-      WHERE tipo IN ('ENTRADA', 'ABASTECIDO')
-        AND cancelada = FALSE
-        AND ("timestamp" AT TIME ZONE 'America/Sao_Paulo')::date =
-            (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
-    `);
-
-    const row = resultado.rows[0];
-
-    return (
-      `📊 *RELATÓRIO DIÁRIO — CODETANK*\n` +
-      `Estoque atual: ${formatarLitros(estoque)} litros\n` +
-      `Entradas hoje: ${formatarLitros(row.entradas)} litros\n` +
-      `Abastecimentos hoje: ${formatarLitros(row.abastecimentos)} litros\n` +
-      `Movimentações ativas hoje: ${row.quantidade}` +
-      (estoque < ALERTA_ESTOQUE
-        ? "\n⚠️ *ATENÇÃO: estoque abaixo de 3.000 litros!*"
-        : "")
-    );
-  } finally {
-    client.release();
-  }
-}
-
-// =====================================================
-// ENVIO AUTOMÁTICO DO RELATÓRIO ÀS 19H
-// =====================================================
-
-async function enviarRelatorioDiario() {
-  if (!whatsappConectado || GROUP_ONLY.length === 0) {
-    return;
-  }
-
-  const agora = new Date();
-
-  const horario = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "America/Sao_Paulo",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).format(agora);
-
-  if (horario !== "19:00") return;
-
-  const hoje = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(agora);
-
-  const relatorio = await gerarRelatorio();
-
-  for (const grupo of GROUP_ONLY) {
-    const jaEnviado = await pool.query(
-      `
-        SELECT 1
-        FROM relatorios_enviados
-        WHERE data_relatorio = $1::date
-          AND grupo_jid = $2
-      `,
-      [hoje, grupo]
-    );
-
-    if (jaEnviado.rowCount > 0) continue;
-
-    await enviarTexto(grupo, relatorio);
-
-    await pool.query(
-      `
-        INSERT INTO relatorios_enviados (
-          data_relatorio,
-          grupo_jid
-        )
-        VALUES ($1::date, $2)
-        ON CONFLICT DO NOTHING
-      `,
-      [hoje, grupo]
-    );
-  }
-}
-
-// =====================================================
+// ==========================================
 // ENVIO DE MENSAGENS
-// =====================================================
+// ==========================================
 
 async function enviarTexto(destino, texto) {
   if (!sock || !whatsappConectado) return;
 
-  await sock.sendMessage(destino, { text: texto });
+  await sock.sendMessage(destino, {
+    text: texto,
+  });
 }
 
-// =====================================================
-// PROCESSAR MENSAGENS
-// =====================================================
+// ==========================================
+// PROCESSAMENTO DAS MENSAGENS
+// ==========================================
 
 async function processarMensagem(msg) {
   const grupo = msg.key?.remoteJid;
@@ -684,10 +576,10 @@ async function processarMensagem(msg) {
   }
 
   const texto = extrairTexto(msg.message);
+
   if (!texto) return;
 
   const comando = normalizarTexto(texto).toUpperCase();
-
   const remetente = jidRemetente(msg);
   const nome = nomeRemetente(msg);
   const messageId = chaveMensagem(msg);
@@ -703,7 +595,7 @@ async function processarMensagem(msg) {
         grupo,
         "*COMANDOS DO CODETANK*\n\n" +
           "ESTOQUE — consulta o estoque\n" +
-          "ABASTECIDO: 250 litros — registra saída\n" +
+          "ABASTECIDO: 250 litros — registra abastecimento/saída\n" +
           "ENTRADA: 5000 — registra recebimento\n" +
           "RECEBIDO: 5000 — registra recebimento\n" +
           "CANCELAR — cancela a movimentação ativa mais recente\n" +
@@ -715,7 +607,10 @@ async function processarMensagem(msg) {
       return;
     }
 
-    if (comando === "RELATORIO" || comando === "RELATÓRIO") {
+    if (
+      comando === "RELATORIO" ||
+      comando === "RELATÓRIO"
+    ) {
       await enviarTexto(grupo, await gerarRelatorio());
       return;
     }
@@ -735,9 +630,6 @@ async function processarMensagem(msg) {
         quantidade,
         mensagemId: citada,
         remetente,
-        nome,
-        grupo,
-        cancelamentoMessageId: messageId,
       });
 
       await enviarTexto(grupo, resultado.mensagem);
@@ -754,11 +646,15 @@ async function processarMensagem(msg) {
       nome,
       grupo,
       messageId,
+      mensagem: texto,
     });
 
     await enviarTexto(grupo, resultado.mensagem);
   } catch (error) {
-    logger.error({ err: error }, "Erro ao processar mensagem");
+    logger.error(
+      { err: error },
+      "Erro ao processar mensagem"
+    );
 
     await enviarTexto(
       grupo,
@@ -767,9 +663,121 @@ async function processarMensagem(msg) {
   }
 }
 
-// =====================================================
+// ==========================================
+// RELATÓRIO
+// ==========================================
+
+async function gerarRelatorio() {
+  const client = await pool.connect();
+
+  try {
+    const estoque = await obterEstoque(client);
+
+    const hoje = await client.query(`
+      SELECT
+        COALESCE(
+          SUM(
+            CASE
+              WHEN tipo = 'ENTRADA' THEN litros
+              ELSE 0
+            END
+          ), 0
+        ) AS entradas,
+
+        COALESCE(
+          SUM(
+            CASE
+              WHEN tipo = 'ABASTECIDO' THEN litros
+              ELSE 0
+            END
+          ), 0
+        ) AS abastecimentos,
+
+        COUNT(*)::int AS quantidade
+
+      FROM movimentacoes
+
+      WHERE cancelada = FALSE
+        AND tipo IN ('ENTRADA', 'ABASTECIDO')
+        AND (
+          "timestamp" AT TIME ZONE 'America/Sao_Paulo'
+        )::date = (
+          NOW() AT TIME ZONE 'America/Sao_Paulo'
+        )::date
+    `);
+
+    const row = hoje.rows[0];
+
+    return (
+      `📊 *RELATÓRIO DIÁRIO — CODETANK*\n` +
+      `Estoque atual: ${formatarLitros(estoque)} litros\n` +
+      `Entradas hoje: ${formatarLitros(row.entradas)} litros\n` +
+      `Abastecimentos hoje: ${formatarLitros(row.abastecimentos)} litros\n` +
+      `Movimentações ativas hoje: ${row.quantidade}` +
+      (estoque < ALERTA_ESTOQUE
+        ? "\n⚠️ *ATENÇÃO: estoque abaixo de 3.000 litros!*"
+        : "")
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// ==========================================
+// RELATÓRIO AUTOMÁTICO ÀS 19H
+// ==========================================
+
+async function enviarRelatorioDiario() {
+  if (!whatsappConectado || GROUP_ONLY.length === 0) {
+    return;
+  }
+
+  const agora = new Date();
+
+  const partes = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(agora);
+
+  const hora = partes.find(
+    (p) => p.type === "hour"
+  )?.value;
+
+  const minuto = partes.find(
+    (p) => p.type === "minute"
+  )?.value;
+
+  if (hora !== "19" || minuto !== "00") return;
+
+  const hoje = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(agora);
+
+  const marcado = await pool.query(
+    `INSERT INTO relatorios_enviados (data)
+     VALUES ($1)
+     ON CONFLICT (data) DO NOTHING
+     RETURNING data`,
+    [hoje]
+  );
+
+  if (!marcado.rowCount) return;
+
+  const relatorio = await gerarRelatorio();
+
+  for (const grupo of GROUP_ONLY) {
+    await enviarTexto(grupo, relatorio);
+  }
+}
+
+// ==========================================
 // CONEXÃO WHATSAPP
-// =====================================================
+// ==========================================
 
 async function iniciarWhatsApp() {
   if (iniciandoWhatsApp) return;
@@ -777,7 +785,9 @@ async function iniciarWhatsApp() {
   iniciandoWhatsApp = true;
 
   try {
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    fs.mkdirSync(path.dirname(AUTH_DIR), {
+      recursive: true,
+    });
 
     const { state, saveCreds } =
       await useMultiFileAuthState(AUTH_DIR);
@@ -794,16 +804,22 @@ async function iniciarWhatsApp() {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const {
+        connection,
+        lastDisconnect,
+        qr,
+      } = update;
 
       if (qr) {
         qrAtual = await qrcode.toDataURL(qr);
-        logger.info("QR Code gerado. Acesse /qr para visualizar.");
+
+        logger.info(
+          "QR Code gerado. Acesse /qr para visualizar."
+        );
       }
 
       if (connection === "open") {
         whatsappConectado = true;
-        iniciandoWhatsApp = false;
         qrAtual = null;
 
         logger.info("WhatsApp conectado!");
@@ -811,7 +827,6 @@ async function iniciarWhatsApp() {
 
       if (connection === "close") {
         whatsappConectado = false;
-        iniciandoWhatsApp = false;
 
         const statusCode =
           lastDisconnect?.error?.output?.statusCode;
@@ -825,24 +840,32 @@ async function iniciarWhatsApp() {
         );
 
         if (deveReconectar) {
+          iniciandoWhatsApp = false;
+
           setTimeout(() => iniciarWhatsApp(), 3000);
         } else {
           logger.error(
-            "Sessão desconectada. Será necessário autenticar novamente."
+            "WhatsApp desconectado. Remova a sessão antiga e gere novo QR."
           );
         }
       }
     });
 
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
+    sock.ev.on(
+      "messages.upsert",
+      async ({ messages, type }) => {
+        if (type !== "notify") return;
 
-      for (const msg of messages) {
-        await processarMensagem(msg);
+        for (const msg of messages) {
+          await processarMensagem(msg);
+        }
       }
-    });
+    );
   } catch (error) {
-    logger.error({ err: error }, "Falha ao iniciar WhatsApp");
+    logger.error(
+      { err: error },
+      "Falha ao iniciar WhatsApp"
+    );
 
     iniciandoWhatsApp = false;
 
@@ -850,9 +873,9 @@ async function iniciarWhatsApp() {
   }
 }
 
-// =====================================================
-// ROTAS HTTP
-// =====================================================
+// ==========================================
+// ROTAS DO SERVIDOR
+// ==========================================
 
 app.get("/health", async (_req, res) => {
   try {
@@ -875,13 +898,15 @@ app.get("/health", async (_req, res) => {
 
 app.get("/qr", async (_req, res) => {
   if (whatsappConectado) {
-    return res.send("<h2>WhatsApp já está conectado ao CodeTank.</h2>");
+    return res.send(
+      "<h2>WhatsApp já está conectado ao CodeTank.</h2>"
+    );
   }
 
   if (!qrAtual) {
     return res.status(503).send(
       "<h2>QR ainda não foi gerado.</h2>" +
-      "<p>Aguarde alguns segundos e atualize a página.</p>"
+      "<p>Aguarde alguns segundos e atualize a página. Consulte os logs do Render.</p>"
     );
   }
 
@@ -893,9 +918,15 @@ app.get("/qr", async (_req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>CodeTank - QR Code</title>
       </head>
+
       <body style="font-family:Arial;text-align:center;padding:24px">
         <h2>Conectar WhatsApp ao CodeTank</h2>
-        <p>Abra Dispositivos conectados no WhatsApp e escaneie o QR Code.</p>
+
+        <p>
+          Abra Dispositivos conectados no WhatsApp
+          e escaneie o QR Code.
+        </p>
+
         <img
           src="${qrAtual}"
           alt="QR Code WhatsApp"
@@ -907,12 +938,14 @@ app.get("/qr", async (_req, res) => {
 });
 
 app.get("/", (_req, res) => {
-  res.send("CodeTank está ativo. Consulte /health ou /qr.");
+  res.send(
+    "CodeTank está ativo. Consulte /health ou /qr."
+  );
 });
 
-// =====================================================
-// INICIALIZAÇÃO
-// =====================================================
+// ==========================================
+// INICIALIZAÇÃO DO SISTEMA
+// ==========================================
 
 async function iniciarServidor() {
   try {
@@ -925,12 +958,19 @@ async function iniciarServidor() {
     await iniciarWhatsApp();
 
     setInterval(() => {
-      enviarRelatorioDiario().catch((error) => {
-        logger.error({ err: error }, "Erro no relatório diário");
-      });
+      enviarRelatorioDiario().catch((error) =>
+        logger.error(
+          { err: error },
+          "Erro no relatório diário"
+        )
+      );
     }, 60 * 1000);
   } catch (error) {
-    logger.error({ err: error }, "Falha na inicialização");
+    logger.error(
+      { err: error },
+      "Falha na inicialização"
+    );
+
     process.exit(1);
   }
 }
