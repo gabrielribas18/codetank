@@ -1,4 +1,3 @@
-
 import express from 'express';
 import makeWASocket, {
   DisconnectReason,
@@ -56,8 +55,10 @@ function carregarBanco() {
 let banco = carregarBanco();
 let qrAtual = '';
 let qrGeradoEm = 0;
-let socketWhatsApp;
+let socketWhatsApp = null;
 let reconectando = false;
+let temporizadorReconexao = null;
+let tentativaReconexao = 0;
 
 function formatarLitros(valor) {
   return Number(valor).toLocaleString('pt-BR', {
@@ -70,8 +71,8 @@ function textoEstoque() {
     `Estoque atual: ${formatarLitros(banco.estoque)} L\n` +
     `Capacidade máxima: ${formatarLitros(CAPACIDADE_MAXIMA)} L`;
 
-  if (banco.estoque <= LIMITE_ALERTA) {
-    texto += '\n⚠️ ALERTA: estoque em 3.000 L ou menos!';
+  if (banco.estoque < LIMITE_ALERTA) {
+    texto += '\n⚠️ ALERTA: estoque abaixo de 3.000 L!';
   }
 
   return texto;
@@ -92,18 +93,21 @@ function textoRelatorio() {
 function processarMensagem(texto, remetente, nome) {
   const comando = texto.trim().toUpperCase();
 
-  if (comando === 'ESTOQUE') return textoEstoque();
+  if (comando === 'ESTOQUE') {
+    return textoEstoque();
+  }
 
   if (comando === 'AJUDA') {
     return [
       'COMANDOS DO CODE TANK',
+      '',
       'ESTOQUE',
       'ABASTECIDO: 250',
       'ENTRADA: 5000',
       'RECEBIDO: 5000',
       'RELATORIO',
       '',
-      'Digite litros sem separador de milhar: 5000, não 5.000.'
+      'Informe os litros sem separador de milhar: 5000, não 5.000.'
     ].join('\n');
   }
 
@@ -148,6 +152,7 @@ function processarMensagem(texto, remetente, nome) {
   } else {
     if (banco.estoque + quantidade > CAPACIDADE_MAXIMA) {
       const espaco = CAPACIDADE_MAXIMA - banco.estoque;
+
       return `ERRO: capacidade excedida. Espaço disponível: ${formatarLitros(espaco)} L.`;
     }
 
@@ -179,17 +184,20 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ativo: true, estoque: banco.estoque });
+  res.json({
+    ativo: true,
+    conectado: Boolean(socketWhatsApp?.user),
+    estoque: banco.estoque
+  });
 });
 
-// Página temporária para mostrar o QR Code.
-// Proteja ou remova esta rota após conectar o WhatsApp.
+// Página temporária do QR Code
 app.get('/qr', async (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
 
   if (!qrAtual || Date.now() - qrGeradoEm > 60000) {
     return res.status(404).send(
-      'QR Code indisponível ou expirado. Confira os logs do serviço e atualize a página.'
+      'QR Code indisponível ou expirado. Confira os logs e atualize a página.'
     );
   }
 
@@ -252,82 +260,143 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 async function conectarWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  if (reconectando) {
+    console.log('Conexão já está sendo iniciada; evitando conexão duplicada.');
+    return;
+  }
 
-  const socket = makeWASocket({
-    auth: state,
-    browser: ['Code Tank', 'Chrome', '1.0.0'],
-    markOnlineOnConnect: false
-  });
+  reconectando = true;
 
-  socketWhatsApp = socket;
-  socket.ev.on('creds.update', saveCreds);
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-  socket.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      qrAtual = qr;
-      qrGeradoEm = Date.now();
-      console.log('QR Code disponível temporariamente na rota /qr');
-    }
+    const socket = makeWASocket({
+      auth: state,
+      browser: ['Code Tank', 'Chrome', '1.0.0'],
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000
+    });
 
-    if (connection === 'open') {
-      qrAtual = '';
-      console.log('WhatsApp conectado!');
-      reconectando = false;
-    }
+    socketWhatsApp = socket;
 
-    if (connection === 'close' && !reconectando) {
-      const motivo = lastDisconnect?.error?.output?.statusCode;
+    socket.ev.on('creds.update', saveCreds);
 
-      if (motivo === DisconnectReason.loggedOut) {
-        qrAtual = '';
-        console.error('Sessão encerrada. Será necessário conectar novamente.');
-        return;
+    socket.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        qrAtual = qr;
+        qrGeradoEm = Date.now();
+        console.log('QR Code disponível temporariamente na rota /qr');
       }
 
-      reconectando = true;
-      setTimeout(() => {
-        conectarWhatsApp().catch(erro =>
-          console.error('Falha ao reconectar:', erro)
+      if (connection === 'open') {
+        qrAtual = '';
+        tentativaReconexao = 0;
+        reconectando = false;
+        console.log('WhatsApp conectado!');
+      }
+
+      if (connection === 'close') {
+        socketWhatsApp = null;
+        reconectando = false;
+
+        const motivo = lastDisconnect?.error?.output?.statusCode;
+
+        if (motivo === DisconnectReason.loggedOut) {
+          qrAtual = '';
+          console.error(
+            'Sessão encerrada pelo WhatsApp. Será necessário parear novamente pelo QR Code.'
+          );
+          return;
+        }
+
+        if (temporizadorReconexao) {
+          clearTimeout(temporizadorReconexao);
+        }
+
+        tentativaReconexao += 1;
+
+        const espera = Math.min(
+          3000 * (2 ** (tentativaReconexao - 1)),
+          60000
         );
-      }, 3000);
-    }
-  });
 
-  socket.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+        console.log(
+          `WhatsApp desconectado. Tentando reconectar em ${Math.round(espera / 1000)} segundos.`
+        );
 
-    for (const mensagem of messages) {
-      if (!mensagem.message || mensagem.key.fromMe) continue;
+        temporizadorReconexao = setTimeout(() => {
+          temporizadorReconexao = null;
+          conectarWhatsApp().catch(erro => {
+            reconectando = false;
+            console.error('Falha ao reconectar WhatsApp:', erro);
+          });
+        }, espera);
+      }
+    });
 
-      const grupo = mensagem.key.remoteJid;
-      if (!grupo?.endsWith('@g.us')) continue;
-      if (GROUP_ONLY && grupo !== GROUP_ONLY) continue;
+    socket.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
 
-      const texto =
-        mensagem.message.conversation ||
-        mensagem.message.extendedTextMessage?.text ||
-        mensagem.message.imageMessage?.caption ||
-        mensagem.message.videoMessage?.caption ||
-        '';
+      for (const mensagem of messages) {
+        if (!mensagem.message || mensagem.key.fromMe) continue;
 
-      if (!texto.trim()) continue;
+        const grupo = mensagem.key.remoteJid;
 
-      const remetente = mensagem.key.participant || grupo;
-      const nome = mensagem.pushName || remetente;
-      const resposta = processarMensagem(texto, remetente, nome);
+        if (!grupo?.endsWith('@g.us')) continue;
+        if (GROUP_ONLY && grupo !== GROUP_ONLY) continue;
 
-      if (resposta) {
-        try {
-          await socket.sendMessage(grupo, { text: resposta });
-        } catch (erro) {
-          console.error('Erro ao responder no grupo:', erro);
+        const texto =
+          mensagem.message.conversation ||
+          mensagem.message.extendedTextMessage?.text ||
+          mensagem.message.imageMessage?.caption ||
+          mensagem.message.videoMessage?.caption ||
+          '';
+
+        if (!texto.trim()) continue;
+
+        const remetente = mensagem.key.participant || grupo;
+        const nome = mensagem.pushName || remetente;
+        const resposta = processarMensagem(texto, remetente, nome);
+
+        if (resposta) {
+          try {
+            await socket.sendMessage(grupo, { text: resposta });
+          } catch (erro) {
+            console.error('Erro ao responder no grupo:', erro);
+          }
         }
       }
+    });
+  } catch (erro) {
+    reconectando = false;
+    console.error('Erro ao iniciar conexão com WhatsApp:', erro);
+
+    if (temporizadorReconexao) {
+      clearTimeout(temporizadorReconexao);
     }
-  });
+
+    tentativaReconexao += 1;
+
+    const espera = Math.min(
+      3000 * (2 ** (tentativaReconexao - 1)),
+      60000
+    );
+
+    temporizadorReconexao = setTimeout(() => {
+      temporizadorReconexao = null;
+      conectarWhatsApp().catch(console.error);
+    }, espera);
+  }
 }
 
+conectarWhatsApp().catch(erro => {
+  reconectando = false;
+  console.error('Erro ao iniciar o WhatsApp:', erro);
+});
+
+// Relatório diário às 19h, horário de Brasília
 function partesHorarioBrasilia() {
   const partes = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Sao_Paulo',
@@ -342,7 +411,6 @@ function partesHorarioBrasilia() {
   return Object.fromEntries(partes.map(p => [p.type, p.value]));
 }
 
-// Relatório diário às 19h, horário de Brasília.
 setInterval(async () => {
   try {
     const horario = partesHorarioBrasilia();
@@ -362,12 +430,9 @@ setInterval(async () => {
 
     banco.ultimoRelatorio = hoje;
     salvarBanco();
+
     console.log(`Relatório diário enviado em ${hoje}.`);
   } catch (erro) {
     console.error('Erro no relatório diário:', erro);
   }
 }, 15000);
-
-conectarWhatsApp().catch(erro => {
-  console.error('Erro ao iniciar o WhatsApp:', erro);
-});
