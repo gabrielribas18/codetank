@@ -212,6 +212,141 @@ async function textoEstoque() {
 }
 
 // ==========================================
+// PREVISÃO DO TEMPO — GUARAPUAVA/PR
+// Usa Open-Meteo, sem chave de API ou dependência adicional.
+// ==========================================
+
+const TEMPO_LOCAL = {
+  nome: "Guarapuava - PR",
+  latitude: -25.3905,
+  longitude: -51.4562,
+};
+
+function descricaoTempo(codigo) {
+  const descricoes = {
+    0: "Céu limpo",
+    1: "Predominantemente limpo",
+    2: "Parcialmente nublado",
+    3: "Nublado",
+    45: "Neblina",
+    48: "Neblina com geada",
+    51: "Garoa fraca",
+    53: "Garoa moderada",
+    55: "Garoa intensa",
+    56: "Garoa congelante fraca",
+    57: "Garoa congelante intensa",
+    61: "Chuva fraca",
+    63: "Chuva moderada",
+    65: "Chuva forte",
+    66: "Chuva congelante fraca",
+    67: "Chuva congelante forte",
+    71: "Neve fraca",
+    73: "Neve moderada",
+    75: "Neve forte",
+    77: "Grãos de neve",
+    80: "Pancadas de chuva fracas",
+    81: "Pancadas de chuva moderadas",
+    82: "Pancadas de chuva fortes",
+    85: "Pancadas de neve fracas",
+    86: "Pancadas de neve fortes",
+    95: "Trovoadas",
+    96: "Trovoadas com granizo fraco",
+    99: "Trovoadas com granizo forte",
+  };
+
+  return descricoes[codigo] || "Condição não identificada";
+}
+
+async function obterPrevisaoTempo() {
+  const url = new URL("https://api.open-meteo.com/v1/forecast");
+
+  url.search = new URLSearchParams({
+    latitude: String(TEMPO_LOCAL.latitude),
+    longitude: String(TEMPO_LOCAL.longitude),
+    current: [
+      "temperature_2m",
+      "apparent_temperature",
+      "relative_humidity_2m",
+      "precipitation",
+      "weather_code",
+      "wind_speed_10m",
+    ].join(","),
+    hourly: "temperature_2m,precipitation_probability",
+    forecast_days: "1",
+    timezone: "America/Sao_Paulo",
+  }).toString();
+
+  const resposta = await fetch(url, {
+    signal: AbortSignal.timeout(12000),
+    headers: { "User-Agent": "CodeTank/1.0" },
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`Open-Meteo respondeu com HTTP ${resposta.status}`);
+  }
+
+  const dados = await resposta.json();
+
+  if (!dados.current || !dados.hourly) {
+    throw new Error("A API não retornou os dados meteorológicos esperados.");
+  }
+
+  const atual = dados.current;
+  const horarios = dados.hourly.time || [];
+
+  const indiceAtual = Math.max(
+    0,
+    horarios.findIndex((horario) => horario >= atual.time)
+  );
+
+  const proximasHoras = [];
+
+  for (
+    let i = indiceAtual;
+    i < Math.min(indiceAtual + 4, horarios.length);
+    i++
+  ) {
+    proximasHoras.push({
+      hora: horarios[i].slice(11, 16),
+      temperatura: dados.hourly.temperature_2m?.[i],
+      chuva: dados.hourly.precipitation_probability?.[i],
+    });
+  }
+
+  const numero = (valor, casas = 0) =>
+    Number.isFinite(Number(valor))
+      ? Number(valor).toLocaleString("pt-BR", {
+          minimumFractionDigits: casas,
+          maximumFractionDigits: casas,
+        })
+      : "indisponível";
+
+  let texto =
+    `🌦️ *PREVISÃO DO TEMPO — ${TEMPO_LOCAL.nome}*\n` +
+    `Atualizado: ${String(atual.time || "").replace("T", " ")}\n\n` +
+    `🌡️ Temperatura: *${numero(atual.temperature_2m)}°C*\n` +
+    `🤔 Sensação térmica: ${numero(atual.apparent_temperature)}°C\n` +
+    `☁️ Condição: ${descricaoTempo(atual.weather_code)}\n` +
+    `💧 Umidade: ${numero(atual.relative_humidity_2m)}%\n` +
+    `🌧️ Precipitação atual: ${numero(atual.precipitation, 1)} mm\n` +
+    `💨 Vento: ${numero(atual.wind_speed_10m)} km/h`;
+
+  if (proximasHoras.length) {
+    texto += "\n\n*PRÓXIMAS HORAS*";
+
+    for (const item of proximasHoras) {
+      texto +=
+        `\n${item.hora} — ${numero(item.temperatura)}°C` +
+        ` | Chuva: ${numero(item.chuva)}%`;
+    }
+  }
+
+  texto += "\n\n_Fonte: Open-Meteo. Previsão sujeita a atualização._";
+
+  return texto;
+}
+
+// ==========================================
 // REGISTRAR ENTRADA E ABASTECIMENTO
 // ==========================================
 
@@ -296,9 +431,6 @@ async function registrarMovimentacao({
           "Operação recusada: o estoque não pode ficar negativo.",
       };
     }
-
-    // CORREÇÃO: a coluna data agora é preenchida automaticamente.
-    // Também utiliza os nomes reais das colunas do banco.
 
     await client.query(
       `INSERT INTO movimentacoes
@@ -444,7 +576,7 @@ async function cancelarMovimentacao({
       return {
         ok: false,
         mensagem:
-          "Não encontrei movimentação ativa correspondente para cancelar.",
+          "Não encontrei uma movimentação ativa correspondente para cancelar.",
       };
     }
 
@@ -456,27 +588,21 @@ async function cancelarMovimentacao({
         ? estoqueAtual - litros
         : estoqueAtual + litros;
 
-    if (
-      novoEstoque < 0 ||
-      novoEstoque > TANQUE_CAPACIDADE
-    ) {
+    if (novoEstoque < 0 || novoEstoque > TANQUE_CAPACIDADE) {
       await client.query("ROLLBACK");
 
       return {
         ok: false,
         mensagem:
-          "Cancelamento recusado para não ultrapassar a capacidade do tanque ou deixar o estoque negativo.",
+          "Cancelamento recusado para não deixar o estoque negativo ou acima da capacidade do tanque.",
       };
     }
 
     await client.query(
       `UPDATE movimentacoes
-       SET cancelada = TRUE,
-           cancelada_por = $1,
-           cancelada_em = NOW(),
-           motivo_cancelamento = 'Cancelamento pelo WhatsApp'
-       WHERE id = $2`,
-      [remetente, mov.id]
+       SET cancelada = TRUE
+       WHERE id = $1`,
+      [mov.id]
     );
 
     await client.query(
@@ -489,12 +615,9 @@ async function cancelarMovimentacao({
          mensagem,
          "timestamp",
          data,
+         whatsapp_message_id,
          grupo_jid,
          cancelada,
-         cancelada_por,
-         cancelada_em,
-         motivo_cancelamento,
-         movimentacao_origem_id,
          criada_em
        )
        VALUES (
@@ -508,21 +631,17 @@ async function cancelarMovimentacao({
            NOW() AT TIME ZONE 'America/Sao_Paulo',
            'DD/MM/YYYY'
          ),
+         NULL,
          $5,
          FALSE,
-         $2,
-         NOW(),
-         'Cancelamento pelo WhatsApp',
-         $6,
          NOW()
        )`,
       [
         litros,
         remetente,
-        mov.nome || remetente,
-        `Cancelou movimentação #${mov.id}: ${mov.tipo} ${litros} L`,
-        mov.grupo_jid || null,
-        mov.id,
+        "Cancelamento",
+        `Cancelamento da movimentação ID ${mov.id}`,
+        mov.grupo_jid,
       ]
     );
 
@@ -553,10 +672,13 @@ async function cancelarMovimentacao({
 // ENVIO DE MENSAGENS
 // ==========================================
 
-async function enviarTexto(destino, texto) {
-  if (!sock || !whatsappConectado) return;
+async function enviarTexto(grupo, texto) {
+  if (!sock || !whatsappConectado) {
+    logger.warn("Mensagem não enviada: WhatsApp desconectado.");
+    return;
+  }
 
-  await sock.sendMessage(destino, {
+  await sock.sendMessage(grupo, {
     text: texto,
   });
 }
@@ -590,11 +712,27 @@ async function processarMensagem(msg) {
       return;
     }
 
+    if (comando === "TEMPO") {
+      try {
+        await enviarTexto(grupo, await obterPrevisaoTempo());
+      } catch (error) {
+        logger.error({ err: error }, "Erro ao consultar previsão do tempo");
+
+        await enviarTexto(
+          grupo,
+          "Não consegui consultar a previsão do tempo agora. Tente novamente em alguns minutos."
+        );
+      }
+
+      return;
+    }
+
     if (comando === "AJUDA") {
       await enviarTexto(
         grupo,
         "*COMANDOS DO CODETANK*\n\n" +
           "ESTOQUE — consulta o estoque\n" +
+          "TEMPO — consulta a previsão do tempo de Guarapuava/PR\n" +
           "ABASTECIDO: 250 litros — registra abastecimento/saída\n" +
           "ENTRADA: 5000 — registra recebimento\n" +
           "RECEBIDO: 5000 — registra recebimento\n" +
